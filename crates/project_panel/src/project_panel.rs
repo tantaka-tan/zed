@@ -7215,6 +7215,16 @@ impl Render for ProjectPanel {
                                 list.with_width_from_item(self.state.max_width_item_index)
                             })
                             .track_scroll(&self.scroll_handle)
+                            .capture_any_mouse_down(cx.listener(
+                                |this, event: &MouseDownEvent, window, cx| {
+                                    if event.button == MouseButton::Middle
+                                        && this.stop_middle_click_autoscroll(cx)
+                                    {
+                                        window.prevent_default();
+                                        cx.stop_propagation();
+                                    }
+                                },
+                            ))
                             .on_mouse_down(
                                 MouseButton::Middle,
                                 cx.listener(|this, event: &MouseDownEvent, window, cx| {

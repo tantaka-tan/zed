@@ -27,7 +27,6 @@ use crate::message_editor::SharedSessionCapabilities;
 use crate::ui::{SandboxGroup, SandboxRow, SandboxSection, SandboxStatusTooltip};
 
 use db::kvp::KeyValueStore;
-use gpui::List;
 use gpui::Stateful;
 use gpui::TaskExt;
 use heapless::Vec as ArrayVec;
@@ -580,6 +579,8 @@ pub struct ThreadView {
     pub last_token_limit_telemetry: Option<acp_thread::TokenUsageRatio>,
     thread_feedback: ThreadFeedbackState,
     pub list_state: ListState,
+    middle_click_autoscroll: Option<MiddleClickAutoscroll<ListState>>,
+    middle_click_autoscroll_task: Option<Task<()>>,
     pub session_capabilities: SharedSessionCapabilities,
     pub expanded_tool_call_raw_inputs: HashSet<acp::ToolCallId>,
     collapsed_sandbox_authorization_details: HashSet<acp::ToolCallId>,
@@ -963,6 +964,8 @@ impl ThreadView {
             model_selector,
             profile_selector,
             list_state,
+            middle_click_autoscroll: None,
+            middle_click_autoscroll_task: None,
             session_capabilities,
             resumed_without_history,
             _subscriptions: subscriptions,
@@ -5727,7 +5730,7 @@ fn sandbox_network_rows(network: &SandboxNetPolicy) -> Vec<SandboxRow> {
 }
 
 impl ThreadView {
-    fn render_entries(&mut self, cx: &mut Context<Self>) -> List {
+    fn render_entries(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let max_content_width = AgentSettings::get_global(cx).max_content_width;
         let centered_container = move |content: AnyElement| {
             h_flex().w_full().justify_center().child(
@@ -5738,26 +5741,123 @@ impl ThreadView {
             )
         };
 
-        list(
-            self.list_state.clone(),
-            cx.processor(move |this, index: usize, window, cx| {
-                let entries = this.thread.read(cx).entries();
-                if let Some(entry) = entries.get(index) {
-                    let rendered = this.render_entry(index, entries.len(), entry, window, cx);
-                    centered_container(rendered.into_any_element()).into_any_element()
-                } else if this.generating_indicator_in_list {
-                    let confirmation = entries
-                        .last()
-                        .is_some_and(|entry| Self::is_waiting_for_confirmation(entry));
-                    let rendered = this.render_generating(confirmation, cx);
-                    centered_container(rendered.into_any_element()).into_any_element()
-                } else {
-                    Empty.into_any()
+        v_flex()
+            .size_full()
+            .flex_grow_1()
+            .child(
+                list(
+                    self.list_state.clone(),
+                    cx.processor(move |this, index: usize, window, cx| {
+                        let entries = this.thread.read(cx).entries();
+                        if let Some(entry) = entries.get(index) {
+                            let rendered =
+                                this.render_entry(index, entries.len(), entry, window, cx);
+                            centered_container(rendered.into_any_element()).into_any_element()
+                        } else if this.generating_indicator_in_list {
+                            let confirmation = entries
+                                .last()
+                                .is_some_and(|entry| Self::is_waiting_for_confirmation(entry));
+                            let rendered = this.render_generating(confirmation, cx);
+                            centered_container(rendered.into_any_element()).into_any_element()
+                        } else {
+                            Empty.into_any()
+                        }
+                    }),
+                )
+                .with_sizing_behavior(gpui::ListSizingBehavior::Auto)
+                .flex_grow_1(),
+            )
+            .flex_grow_1()
+            .capture_any_mouse_down(cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                if event.button == MouseButton::Middle
+                    && EditorSettings::get_global(cx).middle_click_autoscroll
+                {
+                    this.toggle_middle_click_autoscroll(event.position, window, cx);
+                    window.prevent_default();
+                    cx.stop_propagation();
                 }
-            }),
-        )
-        .with_sizing_behavior(gpui::ListSizingBehavior::Auto)
-        .flex_grow_1()
+            }))
+            .on_mouse_down(
+                MouseButton::Middle,
+                cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                    this.toggle_middle_click_autoscroll(event.position, window, cx);
+                    window.prevent_default();
+                    cx.stop_propagation();
+                }),
+            )
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _window, cx| {
+                if this.update_middle_click_autoscroll(event, cx) {
+                    cx.stop_propagation();
+                }
+            }))
+    }
+
+    fn toggle_middle_click_autoscroll(
+        &mut self,
+        origin: gpui::Point<gpui::Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !EditorSettings::get_global(cx).middle_click_autoscroll {
+            return;
+        }
+
+        if self.stop_middle_click_autoscroll(cx) {
+            return;
+        }
+
+        self.middle_click_autoscroll =
+            Some(MiddleClickAutoscroll::new(origin, self.list_state.clone()));
+        self.middle_click_autoscroll_task = Some(cx.spawn_in(window, async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(16))
+                    .await;
+
+                let should_continue = this
+                    .update_in(cx, |this, _window, cx| {
+                        this.tick_middle_click_autoscroll(cx)
+                    })
+                    .unwrap_or(false);
+                if !should_continue {
+                    break;
+                }
+            }
+        }));
+        cx.notify();
+    }
+
+    fn update_middle_click_autoscroll(
+        &mut self,
+        event: &MouseMoveEvent,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(autoscroll) = self.middle_click_autoscroll.as_mut() else {
+            return false;
+        };
+        autoscroll.update(event);
+        cx.notify();
+        true
+    }
+
+    fn stop_middle_click_autoscroll(&mut self, cx: &mut Context<Self>) -> bool {
+        let was_active = self.middle_click_autoscroll.take().is_some();
+        self.middle_click_autoscroll_task = None;
+        if was_active {
+            cx.notify();
+        }
+        was_active
+    }
+
+    fn tick_middle_click_autoscroll(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(autoscroll) = self.middle_click_autoscroll.as_ref() else {
+            return false;
+        };
+
+        if autoscroll.tick() {
+            cx.notify();
+        }
+        true
     }
 
     fn render_entry(
