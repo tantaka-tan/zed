@@ -893,6 +893,19 @@ enum ColumnarSelectionState {
     },
 }
 
+struct MiddleClickAutoscroll {
+    origin: gpui::Point<Pixels>,
+    current: gpui::Point<Pixels>,
+    line_height: Pixels,
+    em_advance: Pixels,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct MiddleClickAutoscrollInfo {
+    pub origin: gpui::Point<Pixels>,
+    pub current: gpui::Point<Pixels>,
+}
+
 /// Represents a button that shows up when hovering over lines in the gutter that don't have
 /// any button on them already (like a bookmark, breakpoint or run indicator).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -938,6 +951,8 @@ pub struct Editor {
     /// typing enters text into each of them, even the ones that aren't focused.
     pub(crate) show_cursor_when_unfocused: bool,
     columnar_selection_state: Option<ColumnarSelectionState>,
+    middle_click_autoscroll: Option<MiddleClickAutoscroll>,
+    middle_click_autoscroll_task: Option<Task<()>>,
     add_selections_state: Option<AddSelectionsState>,
     select_next_state: Option<SelectNextState>,
     select_prev_state: Option<SelectNextState>,
@@ -2153,6 +2168,8 @@ impl Editor {
             selections,
             scroll_manager: ScrollManager::new(cx),
             columnar_selection_state: None,
+            middle_click_autoscroll: None,
+            middle_click_autoscroll_task: None,
             add_selections_state: None,
             select_next_state: None,
             select_prev_state: None,
@@ -3169,6 +3186,10 @@ impl Editor {
     pub fn cancel(&mut self, _: &Cancel, window: &mut Window, cx: &mut Context<Self>) {
         self.selection_mark_mode = false;
         self.selection_drag_state = SelectionDragState::None;
+
+        if self.stop_middle_click_autoscroll(cx) {
+            return;
+        }
 
         if self.dismiss_menus_and_popups(true, window, cx) {
             cx.notify();
@@ -10338,11 +10359,13 @@ impl Editor {
         if event.blurred != self.focus_handle {
             self.last_focused_descendant = Some(event.blurred);
         }
+        self.stop_middle_click_autoscroll(cx);
         self.selection_drag_state = SelectionDragState::None;
         self.refresh_inlay_hints(InlayHintRefreshReason::ModifiersChanged(false), cx);
     }
 
     pub fn handle_blur(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.stop_middle_click_autoscroll(cx);
         self.blink_manager.update(cx, BlinkManager::disable);
         self.buffer
             .update(cx, |buffer, cx| buffer.remove_active_selections(cx));
@@ -10854,6 +10877,135 @@ impl Editor {
 
     pub fn disable_mouse_wheel_zoom(&mut self) {
         self.enable_mouse_wheel_zoom = false;
+    }
+
+    pub(crate) fn start_middle_click_autoscroll(
+        &mut self,
+        origin: gpui::Point<Pixels>,
+        line_height: Pixels,
+        em_advance: Pixels,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.middle_click_autoscroll = Some(MiddleClickAutoscroll {
+            origin,
+            current: origin,
+            line_height,
+            em_advance,
+        });
+
+        self.middle_click_autoscroll_task = Some(cx.spawn_in(window, async move |editor, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(16))
+                    .await;
+
+                let should_continue = editor
+                    .update_in(cx, |editor, window, cx| {
+                        editor.tick_middle_click_autoscroll(window, cx)
+                    })
+                    .unwrap_or(false);
+
+                if !should_continue {
+                    break;
+                }
+            }
+        }));
+    }
+
+    pub(crate) fn toggle_middle_click_autoscroll(
+        &mut self,
+        origin: gpui::Point<Pixels>,
+        line_height: Pixels,
+        em_advance: Pixels,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.stop_middle_click_autoscroll(cx) {
+            self.start_middle_click_autoscroll(origin, line_height, em_advance, window, cx);
+        }
+    }
+
+    pub(crate) fn update_middle_click_autoscroll(
+        &mut self,
+        current: gpui::Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(autoscroll) = self.middle_click_autoscroll.as_mut() else {
+            return false;
+        };
+        autoscroll.current = current;
+        cx.notify();
+        true
+    }
+
+    pub(crate) fn middle_click_autoscroll_info(&self) -> Option<MiddleClickAutoscrollInfo> {
+        self.middle_click_autoscroll
+            .as_ref()
+            .map(|autoscroll| MiddleClickAutoscrollInfo {
+                origin: autoscroll.origin,
+                current: autoscroll.current,
+            })
+    }
+
+    pub(crate) fn stop_middle_click_autoscroll(&mut self, cx: &mut Context<Self>) -> bool {
+        let was_active = self.middle_click_autoscroll.take().is_some();
+        self.middle_click_autoscroll_task = None;
+        if was_active {
+            cx.notify();
+        }
+        was_active
+    }
+
+    fn tick_middle_click_autoscroll(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some((dx, dy, em_advance, line_height)) =
+            self.middle_click_autoscroll.as_ref().map(|autoscroll| {
+                (
+                    Self::middle_click_autoscroll_velocity(
+                        autoscroll.current.x - autoscroll.origin.x,
+                    ),
+                    Self::middle_click_autoscroll_velocity(
+                        autoscroll.current.y - autoscroll.origin.y,
+                    ),
+                    autoscroll.em_advance,
+                    autoscroll.line_height,
+                )
+            })
+        else {
+            return false;
+        };
+
+        if dx == 0.0 && dy == 0.0 {
+            return true;
+        }
+
+        let current_position = self.scroll_position(cx);
+        let scroll_position = point(
+            current_position.x + f64::from(dx / em_advance.as_f32().max(1.0)),
+            current_position.y + f64::from(dy / line_height.as_f32().max(1.0)),
+        );
+        self.set_scroll_position(scroll_position, window, cx);
+        true
+    }
+
+    fn middle_click_autoscroll_velocity(delta: Pixels) -> f32 {
+        const DEAD_ZONE: Pixels = px(8.);
+        const LINEAR_SCALE: f32 = 0.16;
+        const QUADRATIC_SCALE: f32 = 0.022;
+        const MAX_PIXELS_PER_TICK: f32 = 180.0;
+
+        let distance = delta.abs();
+        if distance <= DEAD_ZONE {
+            return 0.0;
+        }
+
+        let distance = (distance - DEAD_ZONE).as_f32();
+        (distance * LINEAR_SCALE + distance * distance * QUADRATIC_SCALE).min(MAX_PIXELS_PER_TICK)
+            * delta.signum()
     }
 
     fn update_data_on_scroll(

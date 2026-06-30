@@ -5495,7 +5495,9 @@ impl EditorElement {
             }),
             |window| {
                 let editor = self.editor.read(cx);
-                if let SelectionDragState::ReadyToDrag {
+                if editor.middle_click_autoscroll_info().is_some() {
+                    window.set_cursor_style(CursorStyle::Arrow, &layout.position_map.text_hitbox);
+                } else if let SelectionDragState::ReadyToDrag {
                     mouse_down_time, ..
                 } = &editor.selection_drag_state
                 {
@@ -5537,6 +5539,7 @@ impl EditorElement {
                 self.paint_redactions(layout, window);
                 self.paint_navigation_overlays(layout, window, cx);
                 self.paint_cursors(layout, window, cx);
+                self.paint_middle_click_autoscroll_indicator(layout, window, cx);
                 self.paint_inline_diagnostics(layout, window, cx);
                 self.paint_inline_blame(layout, window, cx);
                 self.paint_inline_code_actions(layout, window, cx);
@@ -5727,6 +5730,94 @@ impl EditorElement {
     fn paint_cursors(&mut self, layout: &mut EditorLayout, window: &mut Window, cx: &mut App) {
         for cursor in &mut layout.visible_cursors {
             cursor.paint(layout.content_origin, window, cx);
+        }
+    }
+
+    fn paint_middle_click_autoscroll_indicator(
+        &self,
+        layout: &EditorLayout,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let Some(autoscroll) = self.editor.read(cx).middle_click_autoscroll_info() else {
+            return;
+        };
+        if !layout
+            .position_map
+            .text_hitbox
+            .bounds
+            .contains(&autoscroll.origin)
+        {
+            return;
+        }
+
+        let origin = autoscroll.origin;
+        let delta = autoscroll.current - autoscroll.origin;
+        let colors = cx.theme().colors();
+        let border = colors.text.opacity(0.75);
+        let fill_color = colors.editor_background.opacity(0.88);
+        let accent = colors.text_accent.opacity(0.85);
+        let radius = px(12.);
+        let inner_radius = px(3.);
+        let bounds = Bounds::new(
+            point(origin.x - radius, origin.y - radius),
+            size(radius * 2., radius * 2.),
+        );
+
+        window.paint_quad(quad(
+            bounds,
+            Corners::all(radius),
+            fill_color,
+            Edges::all(px(1.)),
+            border,
+            BorderStyle::Solid,
+        ));
+        window.paint_quad(quad(
+            Bounds::new(
+                point(origin.x - inner_radius, origin.y - inner_radius),
+                size(inner_radius * 2., inner_radius * 2.),
+            ),
+            Corners::all(inner_radius),
+            accent,
+            Edges::default(),
+            transparent_black(),
+            BorderStyle::default(),
+        ));
+
+        let marker_color = if delta.y < -px(8.) || delta.y > px(8.) {
+            accent
+        } else {
+            border
+        };
+        for marker in [
+            Bounds::new(
+                point(origin.x - px(1.), origin.y - px(20.)),
+                size(px(2.), px(5.)),
+            ),
+            Bounds::new(
+                point(origin.x - px(1.), origin.y + px(15.)),
+                size(px(2.), px(5.)),
+            ),
+        ] {
+            window.paint_quad(fill(marker, marker_color));
+        }
+
+        let marker_color = if delta.x < -px(8.) || delta.x > px(8.) {
+            accent
+        } else {
+            border
+        };
+        for marker in [
+            Bounds::new(
+                point(origin.x - px(20.), origin.y - px(1.)),
+                size(px(5.), px(2.)),
+            ),
+            Bounds::new(
+                point(origin.x + px(15.), origin.y - px(1.)),
+                size(px(5.), px(2.)),
+            ),
+        ] {
+            window.paint_quad(fill(marker, marker_color));
         }
     }
 

@@ -10,13 +10,14 @@ use anyhow::Context as _;
 use cloud_api_types::{ExtensionMetadata, ExtensionProvides};
 use collections::{BTreeMap, BTreeSet};
 use command_palette_hooks::CommandPaletteFilter;
-use editor::{Editor, EditorElement, EditorStyle};
+use editor::{Editor, EditorElement, EditorSettings, EditorStyle};
 use extension_host::{ExtensionManifest, ExtensionOperation, ExtensionStore};
 use fuzzy::{StringMatch, StringMatchCandidate, match_strings};
 use gpui::{
     Action, Anchor, App, ClipboardItem, Context, DismissEvent, Entity, EventEmitter, Focusable,
-    InteractiveElement, KeyContext, ParentElement, Point, Render, Styled, Task, TaskExt, TextStyle,
-    UniformListScrollHandle, WeakEntity, Window, actions, point, uniform_list,
+    InteractiveElement, KeyContext, MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement,
+    Point, Render, Styled, Task, TaskExt, TextStyle, UniformListScrollHandle, WeakEntity, Window,
+    actions, point, uniform_list,
 };
 use num_format::{Locale, ToFormattedString};
 use picker::{Picker, PickerDelegate};
@@ -28,9 +29,9 @@ use settings::{Settings, SettingsContent};
 use strum::IntoEnumIterator as _;
 use theme_settings::ThemeSettings;
 use ui::{
-    Banner, Chip, ContextMenu, Divider, ListItem, ListItemSpacing, PopoverMenu, ScrollableHandle,
-    Switch, ToggleButtonGroup, ToggleButtonGroupSize, ToggleButtonGroupStyle, ToggleButtonSimple,
-    Tooltip, WithScrollbar, prelude::*,
+    Banner, Chip, ContextMenu, Divider, ListItem, ListItemSpacing, MiddleClickAutoscroll,
+    PopoverMenu, ScrollableHandle, Switch, ToggleButtonGroup, ToggleButtonGroupSize,
+    ToggleButtonGroupStyle, ToggleButtonSimple, Tooltip, WithScrollbar, prelude::*,
 };
 use util::ResultExt;
 use vim_mode_setting::VimModeSetting;
@@ -414,6 +415,8 @@ struct ExtensionCardButtons {
 pub struct ExtensionsPage {
     workspace: WeakEntity<Workspace>,
     list: UniformListScrollHandle,
+    middle_click_autoscroll: Option<MiddleClickAutoscroll<UniformListScrollHandle>>,
+    middle_click_autoscroll_task: Option<Task<()>>,
     is_fetching_extensions: bool,
     fetch_failed: bool,
     filter: ExtensionFilter,
@@ -476,6 +479,8 @@ impl ExtensionsPage {
             let mut this = Self {
                 workspace: workspace.weak_handle(),
                 list: scroll_handle,
+                middle_click_autoscroll: None,
+                middle_click_autoscroll_task: None,
                 is_fetching_extensions: false,
                 fetch_failed: false,
                 filter: ExtensionFilter::All,
@@ -498,6 +503,73 @@ impl ExtensionsPage {
             );
             this
         })
+    }
+
+    fn toggle_middle_click_autoscroll(
+        &mut self,
+        origin: gpui::Point<gpui::Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !EditorSettings::get_global(cx).middle_click_autoscroll {
+            return;
+        }
+
+        if self.stop_middle_click_autoscroll(cx) {
+            return;
+        }
+
+        self.middle_click_autoscroll = Some(MiddleClickAutoscroll::new(origin, self.list.clone()));
+        self.middle_click_autoscroll_task = Some(cx.spawn_in(window, async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(16))
+                    .await;
+
+                let should_continue = this
+                    .update_in(cx, |this, _window, cx| {
+                        this.tick_middle_click_autoscroll(cx)
+                    })
+                    .unwrap_or(false);
+                if !should_continue {
+                    break;
+                }
+            }
+        }));
+        cx.notify();
+    }
+
+    fn update_middle_click_autoscroll(
+        &mut self,
+        event: &MouseMoveEvent,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(autoscroll) = self.middle_click_autoscroll.as_mut() else {
+            return false;
+        };
+        autoscroll.update(event);
+        cx.notify();
+        true
+    }
+
+    fn stop_middle_click_autoscroll(&mut self, cx: &mut Context<Self>) -> bool {
+        let was_active = self.middle_click_autoscroll.take().is_some();
+        self.middle_click_autoscroll_task = None;
+        if was_active {
+            cx.notify();
+        }
+        was_active
+    }
+
+    fn tick_middle_click_autoscroll(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(autoscroll) = self.middle_click_autoscroll.as_ref() else {
+            return false;
+        };
+
+        if autoscroll.tick() {
+            cx.notify();
+        }
+        true
     }
 
     fn on_extension_installed(
@@ -2058,7 +2130,22 @@ impl Render for ExtensionsPage {
                         uniform_list("entries", count, cx.processor(Self::render_extensions))
                             .flex_grow_1()
                             .pb_4()
-                            .track_scroll(scroll_handle),
+                            .track_scroll(scroll_handle)
+                            .on_mouse_down(
+                                MouseButton::Middle,
+                                cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                                    this.toggle_middle_click_autoscroll(event.position, window, cx);
+                                    window.prevent_default();
+                                    cx.stop_propagation();
+                                }),
+                            )
+                            .on_mouse_move(cx.listener(
+                                |this, event: &MouseMoveEvent, _window, cx| {
+                                    if this.update_middle_click_autoscroll(event, cx) {
+                                        cx.stop_propagation();
+                                    }
+                                },
+                            )),
                     )
                     .vertical_scrollbar_for(scroll_handle, window, cx)
                     .into_any_element()

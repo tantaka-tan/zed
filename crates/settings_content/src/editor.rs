@@ -85,6 +85,10 @@ pub struct EditorSettingsContent {
     ///
     /// Default: false
     pub autoscroll_on_clicks: Option<bool>,
+    /// Whether to autoscroll the editor while the middle mouse button is pressed.
+    ///
+    /// Default: false
+    pub middle_click_autoscroll: Option<bool>,
     /// The number of characters to keep on either side when scrolling with the mouse.
     ///
     /// Default: 5.

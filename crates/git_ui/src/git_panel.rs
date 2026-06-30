@@ -15,7 +15,10 @@ use anyhow::Context as _;
 use askpass::AskPassDelegate;
 use collections::{BTreeMap, HashMap, HashSet};
 use db::kvp::KeyValueStore;
-use editor::{Editor, EditorElement, EditorMode, MultiBuffer, MultiBufferOffset, SizingBehavior};
+use editor::{
+    Editor, EditorElement, EditorMode, EditorSettings, MultiBuffer, MultiBufferOffset,
+    SizingBehavior,
+};
 use editor::{EditorStyle, RewrapOptions};
 use file_icons::FileIcons;
 use futures::StreamExt as _;
@@ -38,7 +41,7 @@ use git::{
 use gpui::{
     AbsoluteLength, Action, Anchor, AsyncApp, AsyncWindowContext, Bounds, ClickEvent, DismissEvent,
     Empty, Entity, EventEmitter, FocusHandle, Focusable, KeyContext, MouseButton, MouseDownEvent,
-    Point, PromptLevel, ScrollStrategy, Subscription, Task, TaskExt, TextStyle,
+    MouseMoveEvent, Point, PromptLevel, ScrollStrategy, Subscription, Task, TaskExt, TextStyle,
     UniformListScrollHandle, WeakEntity, actions, anchored, deferred, point, size, uniform_list,
 };
 use itertools::Itertools;
@@ -78,8 +81,9 @@ use theme_settings::ThemeSettings;
 use time::OffsetDateTime;
 use ui::{
     ButtonLike, Checkbox, ContextMenu, ContextMenuEntry, Divider, ElevationIndex,
-    IndentGuideColors, KeyBinding, PopoverMenu, ProjectEmptyState, RenderedIndentGuide, ScrollAxes,
-    Scrollbars, SplitButton, Tab, TintColor, Tooltip, WithScrollbar, prelude::*,
+    IndentGuideColors, KeyBinding, MiddleClickAutoscroll, PopoverMenu, ProjectEmptyState,
+    RenderedIndentGuide, ScrollAxes, Scrollbars, SplitButton, Tab, TintColor, Tooltip,
+    WithScrollbar, prelude::*,
 };
 use util::paths::PathStyle;
 use util::{ResultExt, TryFutureExt, markdown::MarkdownInlineCode, maybe, rel_path::RelPath};
@@ -775,6 +779,8 @@ pub struct GitPanel {
     pending_serialization: Task<()>,
     pub(crate) project: Entity<Project>,
     scroll_handle: UniformListScrollHandle,
+    middle_click_autoscroll: Option<MiddleClickAutoscroll<UniformListScrollHandle>>,
+    middle_click_autoscroll_task: Option<Task<()>>,
     max_width_item_index: Option<usize>,
     selected_entry: Option<usize>,
     marked_entries: Vec<usize>,
@@ -1049,6 +1055,8 @@ impl GitPanel {
                 single_tracked_entry: None,
                 project,
                 scroll_handle,
+                middle_click_autoscroll: None,
+                middle_click_autoscroll_task: None,
                 max_width_item_index: None,
                 selected_entry: None,
                 marked_entries: Vec::new(),
@@ -6032,7 +6040,27 @@ impl GitPanel {
                         }
                     })
                     .size_full()
-                    .track_scroll(&commit_history_scroll_handle),
+                    .track_scroll(&commit_history_scroll_handle)
+                    .on_mouse_down(MouseButton::Middle, {
+                        let commit_history_scroll_handle = commit_history_scroll_handle.clone();
+                        cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                            this.toggle_middle_click_autoscroll(
+                                event.position,
+                                commit_history_scroll_handle.clone(),
+                                window,
+                                cx,
+                            );
+                            window.prevent_default();
+                            cx.stop_propagation();
+                        })
+                    })
+                    .on_mouse_move(cx.listener(
+                        |this, event: &MouseMoveEvent, _window, cx| {
+                            if this.update_middle_click_autoscroll(event, cx) {
+                                cx.stop_propagation();
+                            }
+                        },
+                    )),
                 )
                 .vertical_scrollbar_for(&commit_history_scroll_handle, window, cx),
         )
@@ -6368,7 +6396,27 @@ impl GitPanel {
                         .size_full()
                         .flex_grow_1()
                         .with_width_from_item(self.max_width_item_index)
-                        .track_scroll(&self.scroll_handle),
+                        .track_scroll(&self.scroll_handle)
+                        .on_mouse_down(MouseButton::Middle, {
+                            let scroll_handle = self.scroll_handle.clone();
+                            cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                                this.toggle_middle_click_autoscroll(
+                                    event.position,
+                                    scroll_handle.clone(),
+                                    window,
+                                    cx,
+                                );
+                                window.prevent_default();
+                                cx.stop_propagation();
+                            })
+                        })
+                        .on_mouse_move(cx.listener(
+                            |this, event: &MouseMoveEvent, _window, cx| {
+                                if this.update_middle_click_autoscroll(event, cx) {
+                                    cx.stop_propagation();
+                                }
+                            },
+                        )),
                     )
                     .on_mouse_down(
                         MouseButton::Right,
@@ -7143,6 +7191,74 @@ impl GitPanel {
         if self.amend_pending {
             self.load_last_commit_message(cx);
         }
+    }
+
+    fn toggle_middle_click_autoscroll(
+        &mut self,
+        origin: Point<Pixels>,
+        scroll_handle: UniformListScrollHandle,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !EditorSettings::get_global(cx).middle_click_autoscroll {
+            return;
+        }
+
+        if self.stop_middle_click_autoscroll(cx) {
+            return;
+        }
+
+        self.middle_click_autoscroll = Some(MiddleClickAutoscroll::new(origin, scroll_handle));
+        self.middle_click_autoscroll_task = Some(cx.spawn_in(window, async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(16))
+                    .await;
+
+                let should_continue = this
+                    .update_in(cx, |this, _window, cx| {
+                        this.tick_middle_click_autoscroll(cx)
+                    })
+                    .unwrap_or(false);
+                if !should_continue {
+                    break;
+                }
+            }
+        }));
+        cx.notify();
+    }
+
+    fn update_middle_click_autoscroll(
+        &mut self,
+        event: &MouseMoveEvent,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(autoscroll) = self.middle_click_autoscroll.as_mut() else {
+            return false;
+        };
+        autoscroll.update(event);
+        cx.notify();
+        true
+    }
+
+    fn stop_middle_click_autoscroll(&mut self, cx: &mut Context<Self>) -> bool {
+        let was_active = self.middle_click_autoscroll.take().is_some();
+        self.middle_click_autoscroll_task = None;
+        if was_active {
+            cx.notify();
+        }
+        was_active
+    }
+
+    fn tick_middle_click_autoscroll(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(autoscroll) = self.middle_click_autoscroll.as_ref() else {
+            return false;
+        };
+
+        if autoscroll.tick() {
+            cx.notify();
+        }
+        true
     }
 }
 

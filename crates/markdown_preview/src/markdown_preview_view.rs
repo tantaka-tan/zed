@@ -8,11 +8,12 @@ use std::time::Duration;
 
 use anyhow::{Context as _, Result};
 use editor::scroll::Autoscroll;
-use editor::{Editor, EditorEvent, MultiBufferOffset, SelectionEffects};
+use editor::{Editor, EditorEvent, EditorSettings, MultiBufferOffset, SelectionEffects};
 use gpui::{
     App, ClipboardItem, Context, Entity, EventEmitter, FocusHandle, Focusable, ImageSource,
-    InteractiveElement, IntoElement, IsZero, Pixels, Render, Resource, RetainAllImageCache,
-    ScrollHandle, SharedString, SharedUri, Subscription, Task, WeakEntity, Window, point, px,
+    InteractiveElement, IntoElement, IsZero, MouseButton, MouseDownEvent, MouseMoveEvent, Render,
+    Resource, RetainAllImageCache, ScrollHandle, SharedString, SharedUri, Subscription, Task,
+    WeakEntity, Window, point,
 };
 use language::LanguageRegistry;
 use markdown::{
@@ -25,7 +26,7 @@ use settings::{SeedQuerySetting, Settings, update_settings_file};
 use theme::{SystemAppearance, Theme, ThemeRegistry};
 use theme_settings::ThemeSettings;
 use ui::utils::WithRemSize;
-use ui::{ContextMenu, WithScrollbar, prelude::*, right_click_menu};
+use ui::{ContextMenu, MiddleClickAutoscroll, WithScrollbar, prelude::*, right_click_menu};
 use util::markdown::split_local_url_fragment;
 use workspace::item::{Item, ItemBufferKind, ItemHandle, SaveOptions, SerializableItem};
 use workspace::notifications::NotifyResultExt;
@@ -51,6 +52,8 @@ pub struct MarkdownPreviewView {
     _markdown_subscription: Subscription,
     active_source_index: Option<usize>,
     scroll_handle: ScrollHandle,
+    middle_click_autoscroll: Option<MiddleClickAutoscroll<ScrollHandle>>,
+    middle_click_autoscroll_task: Option<Task<()>>,
     image_cache: Entity<RetainAllImageCache>,
     base_directory: Option<PathBuf>,
     pending_update_task: Option<Task<Result<()>>>,
@@ -282,6 +285,8 @@ impl MarkdownPreviewView {
                 markdown,
                 active_source_index: None,
                 scroll_handle: ScrollHandle::new(),
+                middle_click_autoscroll: None,
+                middle_click_autoscroll_task: None,
                 image_cache: RetainAllImageCache::new(cx),
                 base_directory: None,
                 pending_update_task: None,
@@ -1077,6 +1082,82 @@ impl Focusable for MarkdownPreviewView {
     }
 }
 
+impl MarkdownPreviewView {
+    fn toggle_middle_click_autoscroll(
+        &mut self,
+        origin: gpui::Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !EditorSettings::get_global(cx).middle_click_autoscroll {
+            return;
+        }
+
+        if self.stop_middle_click_autoscroll(cx) {
+            return;
+        }
+
+        self.middle_click_autoscroll = Some(MiddleClickAutoscroll::new(
+            origin,
+            self.scroll_handle.clone(),
+        ));
+        self.middle_click_autoscroll_task = Some(cx.spawn_in(window, async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(16))
+                    .await;
+
+                let should_continue = this
+                    .update_in(cx, |this, window, cx| {
+                        this.tick_middle_click_autoscroll(window, cx)
+                    })
+                    .unwrap_or(false);
+                if !should_continue {
+                    break;
+                }
+            }
+        }));
+        cx.notify();
+    }
+
+    fn update_middle_click_autoscroll(
+        &mut self,
+        event: &MouseMoveEvent,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(autoscroll) = self.middle_click_autoscroll.as_mut() else {
+            return false;
+        };
+        autoscroll.update(event);
+        cx.notify();
+        true
+    }
+
+    fn stop_middle_click_autoscroll(&mut self, cx: &mut Context<Self>) -> bool {
+        let was_active = self.middle_click_autoscroll.take().is_some();
+        self.middle_click_autoscroll_task = None;
+        if was_active {
+            cx.notify();
+        }
+        was_active
+    }
+
+    fn tick_middle_click_autoscroll(
+        &mut self,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(autoscroll) = self.middle_click_autoscroll.as_ref() else {
+            return false;
+        };
+
+        if autoscroll.tick() {
+            cx.notify();
+        }
+        true
+    }
+}
+
 impl EventEmitter<MarkdownPreviewEvent> for MarkdownPreviewView {}
 impl EventEmitter<SearchEvent> for MarkdownPreviewView {}
 
@@ -1252,6 +1333,19 @@ impl Render for MarkdownPreviewView {
                         .size_full()
                         .overflow_y_scroll()
                         .track_scroll(&self.scroll_handle)
+                        .on_mouse_down(
+                            MouseButton::Middle,
+                            cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                                this.toggle_middle_click_autoscroll(event.position, window, cx);
+                                window.prevent_default();
+                                cx.stop_propagation();
+                            }),
+                        )
+                        .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _window, cx| {
+                            if this.update_middle_click_autoscroll(event, cx) {
+                                cx.stop_propagation();
+                            }
+                        }))
                         .p_4()
                         .child({
                             let markdown_element =

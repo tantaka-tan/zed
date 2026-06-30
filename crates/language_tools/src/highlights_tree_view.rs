@@ -1,5 +1,5 @@
 use editor::{
-    Anchor, Editor, HighlightKey, MultiBufferSnapshot, SelectionEffects, ToPoint,
+    Anchor, Editor, EditorSettings, HighlightKey, MultiBufferSnapshot, SelectionEffects, ToPoint,
     scroll::Autoscroll,
 };
 use gpui::{
@@ -10,13 +10,14 @@ use gpui::{
 };
 use language::{BufferId, Point, ToOffset};
 use menu::{SelectNext, SelectPrevious};
+use settings::Settings;
 use std::{mem, ops::Range, sync::Arc, time::Duration};
 use theme::ActiveTheme;
 use theme::SyntaxTheme;
 use ui::{
     ButtonCommon, ButtonLike, ButtonStyle, Color, ContextMenu, FluentBuilder as _, IconButton,
-    IconName, IconPosition, IconSize, Label, LabelCommon, LabelSize, PopoverMenu,
-    PopoverMenuHandle, StyledExt, Toggleable, Tooltip, WithScrollbar, h_flex, v_flex,
+    IconName, IconPosition, IconSize, Label, LabelCommon, LabelSize, MiddleClickAutoscroll,
+    PopoverMenu, PopoverMenuHandle, StyledExt, Toggleable, Tooltip, WithScrollbar, h_flex, v_flex,
 };
 use workspace::{
     Event as WorkspaceEvent, SplitDirection, ToolbarItemEvent, ToolbarItemLocation,
@@ -138,6 +139,8 @@ pub struct HighlightsTreeView {
     workspace_handle: WeakEntity<Workspace>,
     editor: Option<EditorState>,
     list_scroll_handle: UniformListScrollHandle,
+    middle_click_autoscroll: Option<MiddleClickAutoscroll<UniformListScrollHandle>>,
+    middle_click_autoscroll_task: Option<Task<()>>,
     selected_item_ix: Option<usize>,
     hovered_item_ix: Option<usize>,
     focus_handle: FocusHandle,
@@ -185,6 +188,8 @@ impl HighlightsTreeView {
         let mut this = Self {
             workspace_handle: workspace_handle.clone(),
             list_scroll_handle: UniformListScrollHandle::new(),
+            middle_click_autoscroll: None,
+            middle_click_autoscroll_task: None,
             editor: None,
             hovered_item_ix: None,
             selected_item_ix: None,
@@ -807,6 +812,76 @@ impl HighlightsTreeView {
             .filter(|entry| self.should_show_entry(entry))
             .count()
     }
+
+    fn toggle_middle_click_autoscroll(
+        &mut self,
+        origin: gpui::Point<gpui::Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !EditorSettings::get_global(cx).middle_click_autoscroll {
+            return;
+        }
+
+        if self.stop_middle_click_autoscroll(cx) {
+            return;
+        }
+
+        self.middle_click_autoscroll = Some(MiddleClickAutoscroll::new(
+            origin,
+            self.list_scroll_handle.clone(),
+        ));
+        self.middle_click_autoscroll_task = Some(cx.spawn_in(window, async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(16))
+                    .await;
+
+                let should_continue = this
+                    .update_in(cx, |this, _window, cx| {
+                        this.tick_middle_click_autoscroll(cx)
+                    })
+                    .unwrap_or(false);
+                if !should_continue {
+                    break;
+                }
+            }
+        }));
+        cx.notify();
+    }
+
+    fn update_middle_click_autoscroll(
+        &mut self,
+        event: &MouseMoveEvent,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(autoscroll) = self.middle_click_autoscroll.as_mut() else {
+            return false;
+        };
+        autoscroll.update(event);
+        cx.notify();
+        true
+    }
+
+    fn stop_middle_click_autoscroll(&mut self, cx: &mut Context<Self>) -> bool {
+        let was_active = self.middle_click_autoscroll.take().is_some();
+        self.middle_click_autoscroll_task = None;
+        if was_active {
+            cx.notify();
+        }
+        was_active
+    }
+
+    fn tick_middle_click_autoscroll(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(autoscroll) = self.middle_click_autoscroll.as_ref() else {
+            return false;
+        };
+
+        if autoscroll.tick() {
+            cx.notify();
+        }
+        true
+    }
 }
 
 impl Render for HighlightsTreeView {
@@ -832,6 +907,19 @@ impl Render for HighlightsTreeView {
                         )
                         .size_full()
                         .track_scroll(&self.list_scroll_handle)
+                        .on_mouse_down(
+                            MouseButton::Middle,
+                            cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                                this.toggle_middle_click_autoscroll(event.position, window, cx);
+                                window.prevent_default();
+                                cx.stop_propagation();
+                            }),
+                        )
+                        .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _window, cx| {
+                            if this.update_middle_click_autoscroll(event, cx) {
+                                cx.stop_propagation();
+                            }
+                        }))
                         .text_bg(cx.theme().colors().background)
                         .into_any_element(),
                     )

@@ -11,13 +11,14 @@ use anyhow::Result;
 use cloud_api_types::Plan;
 use collections::HashMap;
 use context_server::ContextServerId;
-use editor::{Editor, MultiBufferOffset, SelectionEffects, scroll::Autoscroll};
+use editor::{Editor, EditorSettings, MultiBufferOffset, SelectionEffects, scroll::Autoscroll};
 use extension::ExtensionManifest;
 use extension_host::ExtensionStore;
 use fs::Fs;
 use gpui::{
     Action, Anchor, AnyView, App, AsyncWindowContext, Entity, EventEmitter, FocusHandle, Focusable,
-    ScrollHandle, Subscription, Task, TaskExt, WeakEntity,
+    MouseButton, MouseDownEvent, MouseMoveEvent, ScrollHandle, Subscription, Task, TaskExt,
+    WeakEntity,
 };
 use itertools::Itertools;
 use language::LanguageRegistry;
@@ -34,8 +35,8 @@ use project::{
 use settings::{Settings, SettingsContent, SettingsStore, update_settings_file};
 use ui::{
     AiSettingItem, AiSettingItemSource, AiSettingItemStatus, ButtonStyle, Chip, ContextMenu,
-    ContextMenuEntry, Disclosure, Divider, DividerColor, ElevationIndex, LabelSize, PopoverMenu,
-    Switch, Tooltip, WithScrollbar, prelude::*,
+    ContextMenuEntry, Disclosure, Divider, DividerColor, ElevationIndex, LabelSize,
+    MiddleClickAutoscroll, PopoverMenu, Switch, Tooltip, WithScrollbar, prelude::*,
 };
 use util::ResultExt as _;
 use workspace::{Workspace, create_and_open_local_file};
@@ -64,6 +65,8 @@ pub struct AgentConfiguration {
     context_server_registry: Entity<ContextServerRegistry>,
     _subscriptions: Vec<Subscription>,
     scroll_handle: ScrollHandle,
+    middle_click_autoscroll: Option<MiddleClickAutoscroll<ScrollHandle>>,
+    middle_click_autoscroll_task: Option<Task<()>>,
 }
 
 impl AgentConfiguration {
@@ -115,6 +118,8 @@ impl AgentConfiguration {
             context_server_registry,
             _subscriptions: subscriptions,
             scroll_handle: ScrollHandle::new(),
+            middle_click_autoscroll: None,
+            middle_click_autoscroll_task: None,
         };
 
         this.build_provider_configuration_views(window, cx);
@@ -1294,6 +1299,76 @@ impl AgentConfiguration {
             .when_some(restart_button, |this, button| this.action(button))
             .when_some(uninstall_button, |this, button| this.action(button))
     }
+
+    fn toggle_middle_click_autoscroll(
+        &mut self,
+        origin: gpui::Point<gpui::Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !EditorSettings::get_global(cx).middle_click_autoscroll {
+            return;
+        }
+
+        if self.stop_middle_click_autoscroll(cx) {
+            return;
+        }
+
+        self.middle_click_autoscroll = Some(MiddleClickAutoscroll::new(
+            origin,
+            self.scroll_handle.clone(),
+        ));
+        self.middle_click_autoscroll_task = Some(cx.spawn_in(window, async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(16))
+                    .await;
+
+                let should_continue = this
+                    .update_in(cx, |this, _window, cx| {
+                        this.tick_middle_click_autoscroll(cx)
+                    })
+                    .unwrap_or(false);
+                if !should_continue {
+                    break;
+                }
+            }
+        }));
+        cx.notify();
+    }
+
+    fn update_middle_click_autoscroll(
+        &mut self,
+        event: &MouseMoveEvent,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(autoscroll) = self.middle_click_autoscroll.as_mut() else {
+            return false;
+        };
+        autoscroll.update(event);
+        cx.notify();
+        true
+    }
+
+    fn stop_middle_click_autoscroll(&mut self, cx: &mut Context<Self>) -> bool {
+        let was_active = self.middle_click_autoscroll.take().is_some();
+        self.middle_click_autoscroll_task = None;
+        if was_active {
+            cx.notify();
+        }
+        was_active
+    }
+
+    fn tick_middle_click_autoscroll(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(autoscroll) = self.middle_click_autoscroll.as_ref() else {
+            return false;
+        };
+
+        if autoscroll.tick() {
+            cx.notify();
+        }
+        true
+    }
 }
 
 impl Render for AgentConfiguration {
@@ -1313,6 +1388,21 @@ impl Render for AgentConfiguration {
                         v_flex()
                             .id("assistant-configuration-content")
                             .track_scroll(&self.scroll_handle)
+                            .on_mouse_down(
+                                MouseButton::Middle,
+                                cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                                    this.toggle_middle_click_autoscroll(event.position, window, cx);
+                                    window.prevent_default();
+                                    cx.stop_propagation();
+                                }),
+                            )
+                            .on_mouse_move(cx.listener(
+                                |this, event: &MouseMoveEvent, _window, cx| {
+                                    if this.update_middle_click_autoscroll(event, cx) {
+                                        cx.stop_propagation();
+                                    }
+                                },
+                            ))
                             .size_full()
                             .min_w_0()
                             .overflow_y_scroll()

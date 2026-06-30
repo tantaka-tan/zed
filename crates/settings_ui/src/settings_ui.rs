@@ -5,15 +5,15 @@ pub mod pages;
 use agent_skills::SkillIndex;
 use anyhow::{Context as _, Result};
 use cloud_api_types::OrganizationConfiguration;
-use editor::{Editor, EditorEvent};
+use editor::{Editor, EditorEvent, EditorSettings};
 use futures::{StreamExt, channel::mpsc};
 use fuzzy::StringMatchCandidate;
 use gpui::{
     Action, App, AsyncApp, ClipboardItem, DEFAULT_ADDITIONAL_WINDOW_SIZE, Div, Entity, FocusHandle,
-    Focusable, Global, KeyContext, ListState, ReadGlobal as _, Role, ScrollHandle, Stateful,
-    Subscription, Task, Tiling, TitlebarOptions, UniformListScrollHandle, WeakEntity, Window,
-    WindowBounds, WindowHandle, WindowOptions, actions, div, list, point, prelude::*, px,
-    uniform_list,
+    Focusable, Global, KeyContext, ListState, MouseButton, MouseDownEvent, MouseMoveEvent,
+    ReadGlobal as _, Role, ScrollHandle, Stateful, Subscription, Task, Tiling, TitlebarOptions,
+    UniformListScrollHandle, WeakEntity, Window, WindowBounds, WindowHandle, WindowOptions,
+    actions, div, list, point, prelude::*, px, uniform_list,
 };
 use heck::ToTitleCase as _;
 
@@ -40,8 +40,8 @@ use std::{
 use theme_settings::ThemeSettings;
 use ui::{
     Banner, ContextMenu, Divider, DropdownMenu, DropdownStyle, IconButtonShape, KeyBinding,
-    KeybindingHint, PopoverMenu, Scrollbars, Switch, Tooltip, TreeViewItem, WithScrollbar,
-    prelude::*,
+    KeybindingHint, MiddleClickAutoscroll, PopoverMenu, Scrollbars, Switch, Tooltip, TreeViewItem,
+    WithScrollbar, prelude::*,
 };
 
 use util::{ResultExt as _, paths::PathStyle, rel_path::RelPath};
@@ -874,6 +874,8 @@ pub struct SettingsWindow {
     opening_link: bool,
     search_bar: Entity<Editor>,
     search_task: Option<Task<()>>,
+    middle_click_autoscroll: Option<MiddleClickAutoscroll<ScrollHandle>>,
+    middle_click_autoscroll_task: Option<Task<()>>,
     /// Cached settings file buffers to avoid repeated disk I/O on each settings change
     project_setting_file_buffers: HashMap<ProjectPath, Entity<Buffer>>,
     /// Index into navbar_entries
@@ -1895,6 +1897,8 @@ impl SettingsWindow {
             navbar_scroll_handle: UniformListScrollHandle::default(),
             search_bar,
             search_task: None,
+            middle_click_autoscroll: None,
+            middle_click_autoscroll_task: None,
             filter_table: vec![],
             has_query: false,
             content_handles: vec![],
@@ -3553,8 +3557,98 @@ impl SettingsWindow {
             .id("settings-ui-page")
             .size_full()
             .overflow_y_scroll()
-            .track_scroll(scroll_handle);
+            .track_scroll(scroll_handle)
+            .on_mouse_down(MouseButton::Middle, {
+                let scroll_handle = scroll_handle.clone();
+                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    this.toggle_middle_click_autoscroll(
+                        event.position,
+                        scroll_handle.clone(),
+                        window,
+                        cx,
+                    );
+                    window.prevent_default();
+                    cx.stop_propagation();
+                })
+            })
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _window, cx| {
+                if this.update_middle_click_autoscroll(event, cx) {
+                    cx.stop_propagation();
+                }
+            }));
         self.render_sub_page_items_in(page_content, items, false, window, cx)
+    }
+
+    fn toggle_middle_click_autoscroll(
+        &mut self,
+        origin: gpui::Point<Pixels>,
+        scroll_handle: ScrollHandle,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !EditorSettings::get_global(cx).middle_click_autoscroll {
+            return;
+        }
+
+        if self.stop_middle_click_autoscroll(cx) {
+            return;
+        }
+
+        self.middle_click_autoscroll = Some(MiddleClickAutoscroll::new(origin, scroll_handle));
+        self.middle_click_autoscroll_task = Some(cx.spawn_in(window, async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(16))
+                    .await;
+
+                let should_continue = this
+                    .update_in(cx, |this, window, cx| {
+                        this.tick_middle_click_autoscroll(window, cx)
+                    })
+                    .unwrap_or(false);
+                if !should_continue {
+                    break;
+                }
+            }
+        }));
+        cx.notify();
+    }
+
+    fn update_middle_click_autoscroll(
+        &mut self,
+        event: &MouseMoveEvent,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(autoscroll) = self.middle_click_autoscroll.as_mut() else {
+            return false;
+        };
+        autoscroll.update(event);
+        cx.notify();
+        true
+    }
+
+    fn stop_middle_click_autoscroll(&mut self, cx: &mut Context<Self>) -> bool {
+        let was_active = self.middle_click_autoscroll.take().is_some();
+        self.middle_click_autoscroll_task = None;
+        if was_active {
+            cx.notify();
+        }
+        was_active
+    }
+
+    fn tick_middle_click_autoscroll(
+        &mut self,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(autoscroll) = self.middle_click_autoscroll.as_ref() else {
+            return false;
+        };
+
+        if autoscroll.tick() {
+            cx.notify();
+        }
+        true
     }
 
     fn render_sub_page_items_section<'a, Items>(
@@ -5168,6 +5262,8 @@ pub mod test {
                 navbar_entries: Vec::default(),
                 navbar_scroll_handle: UniformListScrollHandle::default(),
                 navbar_focus_subscriptions: Vec::default(),
+                middle_click_autoscroll: None,
+                middle_click_autoscroll_task: None,
                 filter_table: Vec::default(),
                 has_query: false,
                 content_handles: Vec::default(),
@@ -5310,6 +5406,8 @@ pub mod test {
             has_query: false,
             content_handles: vec![],
             search_task: None,
+            middle_click_autoscroll: None,
+            middle_click_autoscroll_task: None,
             focus_handle: cx.focus_handle(),
             navbar_focus_handle: NonFocusableHandle::new(
                 NAVBAR_CONTAINER_TAB_INDEX,

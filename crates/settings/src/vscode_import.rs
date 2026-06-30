@@ -280,6 +280,7 @@ impl VsCodeSettings {
             lsp_document_colors: None,
             lsp_document_links: self.read_bool("editor.links"),
             lsp_highlight_debounce: None,
+            middle_click_autoscroll: None,
             middle_click_paste: None,
             minimap: self.minimap_content(),
             minimum_contrast_for_highlights: None,

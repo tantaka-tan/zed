@@ -466,6 +466,10 @@ impl EditorElement {
                         if editor.hover_state.focused(window, cx) {
                             return;
                         }
+                        if editor.update_middle_click_autoscroll(event.position, cx) {
+                            cx.stop_propagation();
+                            return;
+                        }
                         if event.pressed_button == Some(MouseButton::Left)
                             || event.pressed_button == Some(MouseButton::Middle)
                         {
@@ -814,6 +818,19 @@ impl EditorElement {
         cx: &mut Context<Editor>,
     ) {
         if !position_map.text_hitbox.is_hovered(window) || window.default_prevented() {
+            return;
+        }
+
+        if EditorSettings::get_global(cx).middle_click_autoscroll {
+            editor.toggle_middle_click_autoscroll(
+                event.position,
+                position_map.line_height,
+                position_map.em_advance,
+                window,
+                cx,
+            );
+            window.prevent_default();
+            cx.stop_propagation();
             return;
         }
 
