@@ -2132,10 +2132,8 @@ impl Render for ExtensionsPage {
                             .pb_4()
                             .track_scroll(scroll_handle)
                             .capture_any_mouse_down(cx.listener(
-                                |this, event: &MouseDownEvent, window, cx| {
-                                    if event.button == MouseButton::Middle
-                                        && this.stop_middle_click_autoscroll(cx)
-                                    {
+                                |this, _event: &MouseDownEvent, window, cx| {
+                                    if this.stop_middle_click_autoscroll(cx) {
                                         window.prevent_default();
                                         cx.stop_propagation();
                                     }

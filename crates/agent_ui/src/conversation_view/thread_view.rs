@@ -5769,7 +5769,10 @@ impl ThreadView {
             )
             .flex_grow_1()
             .capture_any_mouse_down(cx.listener(|this, event: &MouseDownEvent, window, cx| {
-                if event.button == MouseButton::Middle
+                if this.stop_middle_click_autoscroll(cx) {
+                    window.prevent_default();
+                    cx.stop_propagation();
+                } else if event.button == MouseButton::Middle
                     && EditorSettings::get_global(cx).middle_click_autoscroll
                 {
                     this.toggle_middle_click_autoscroll(event.position, window, cx);

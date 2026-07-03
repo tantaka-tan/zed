@@ -365,32 +365,40 @@ impl EditorElement {
 
             move |event: &MouseDownEvent, phase, window, cx| {
                 if phase == DispatchPhase::Bubble {
-                    match event.button {
-                        MouseButton::Left => editor.update(cx, |editor, cx| {
-                            let pending_mouse_down = editor
-                                .pending_mouse_down
-                                .get_or_insert_with(Default::default)
-                                .clone();
+                    editor.update(cx, |editor, cx| {
+                        if editor.stop_middle_click_autoscroll(cx) {
+                            window.prevent_default();
+                            cx.stop_propagation();
+                            return;
+                        }
 
-                            *pending_mouse_down.borrow_mut() = Some(event.clone());
+                        match event.button {
+                            MouseButton::Left => {
+                                let pending_mouse_down = editor
+                                    .pending_mouse_down
+                                    .get_or_insert_with(Default::default)
+                                    .clone();
 
-                            Self::mouse_left_down(
-                                editor,
-                                event,
-                                &position_map,
-                                line_numbers.as_ref(),
-                                window,
-                                cx,
-                            );
-                        }),
-                        MouseButton::Right => editor.update(cx, |editor, cx| {
-                            Self::mouse_right_down(editor, event, &position_map, window, cx);
-                        }),
-                        MouseButton::Middle => editor.update(cx, |editor, cx| {
-                            Self::mouse_middle_down(editor, event, &position_map, window, cx);
-                        }),
-                        _ => {}
-                    };
+                                *pending_mouse_down.borrow_mut() = Some(event.clone());
+
+                                Self::mouse_left_down(
+                                    editor,
+                                    event,
+                                    &position_map,
+                                    line_numbers.as_ref(),
+                                    window,
+                                    cx,
+                                );
+                            }
+                            MouseButton::Right => {
+                                Self::mouse_right_down(editor, event, &position_map, window, cx);
+                            }
+                            MouseButton::Middle => {
+                                Self::mouse_middle_down(editor, event, &position_map, window, cx);
+                            }
+                            _ => {}
+                        };
+                    });
                 }
             }
         });

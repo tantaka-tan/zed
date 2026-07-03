@@ -3558,8 +3558,8 @@ impl SettingsWindow {
             .size_full()
             .overflow_y_scroll()
             .track_scroll(scroll_handle)
-            .capture_any_mouse_down(cx.listener(|this, event: &MouseDownEvent, window, cx| {
-                if event.button == MouseButton::Middle && this.stop_middle_click_autoscroll(cx) {
+            .capture_any_mouse_down(cx.listener(|this, _event: &MouseDownEvent, window, cx| {
+                if this.stop_middle_click_autoscroll(cx) {
                     window.prevent_default();
                     cx.stop_propagation();
                 }
